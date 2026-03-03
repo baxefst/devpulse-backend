@@ -1,5 +1,5 @@
 import { Hono } from 'hono'
-import bcrypt from 'bcrypt'
+import bcrypt from 'bcryptjs'
 import { db } from '../db/index.js'
 import { users, refreshTokens } from '../db/schema.js'
 import { eq, and, gte } from 'drizzle-orm'

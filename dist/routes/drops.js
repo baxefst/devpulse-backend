@@ -1,137 +1,143 @@
-import { Hono } from "hono";
-import { zValidator } from "@hono/zod-validator";
-import { db } from "../db/index.js";
-import { drops, milestones, proofs } from "../db/schema.js";
-import { eq, and, sql, desc, isNull } from "drizzle-orm";
-import { createDropSchema, updateDropSchema, paginationSchema } from "../validators/schemas.js";
-import { authMiddleware } from "../middleware/auth.js";
-import { apiRateLimit } from "../middleware/rateLimit.js";
-import { reputationQueue } from "../lib/queue.js";
-import { updateReputationAndRank } from "../lib/reputation.js";
+import { Hono } from 'hono';
+import { db } from '../db/index.js';
+import { drops, milestones, proofs, users } from '../db/schema.js';
+import { eq, and, isNull, ilike, or, desc } from 'drizzle-orm';
+import { authMiddleware } from '../middleware/auth.js';
+import { apiRateLimit } from '../middleware/rateLimit.js';
+import { createDropSchema, dropQuerySchema } from '../validators/schemas.js';
+import { zValidator } from '@hono/zod-validator';
+import { reputationQueue } from '../lib/queue.js';
+import { updateReputationAndRank } from '../lib/reputation.js';
+import { jsonSafeParse } from '../middleware/jsonParser.js';
 const dropsRoute = new Hono();
-// GET /drops
-dropsRoute.get("/", zValidator("query", paginationSchema), async (c) => {
-    const { page, limit, category, search, userId } = c.req.valid("query");
+// GET /drops — public, paginated
+dropsRoute.get('/', zValidator('query', dropQuerySchema), async (c) => {
+    const { page, limit, category, search } = c.req.valid('query');
     const offset = (page - 1) * limit;
-    const data = await db.query.drops.findMany({
-        where: (drops, { and, isNull, eq, or, like }) => {
-            const conditions = [isNull(drops.deletedAt)];
-            if (category)
-                conditions.push(eq(drops.category, category));
-            if (userId)
-                conditions.push(eq(drops.userId, userId));
-            if (search) {
-                const searchOr = or(like(drops.title, `%${search}%`), like(drops.description, `%${search}%`));
-                if (searchOr)
-                    conditions.push(searchOr);
-            }
-            return conditions.length > 1 ? and(...conditions) : conditions[0];
-        },
-        limit,
-        offset,
-        orderBy: [desc(drops.createdAt)],
-        with: {
-            user: {
-                columns: {
-                    username: true,
-                    displayName: true,
-                    reputationScore: true,
-                }
-            }
-        }
-    });
-    return c.json({ data, page, limit });
+    const conditions = [isNull(drops.deleted_at)];
+    if (category)
+        conditions.push(eq(drops.category, category));
+    if (search) {
+        conditions.push(or(ilike(drops.title, `%${search}%`), ilike(drops.description, `%${search}%`)));
+    }
+    const rows = await db.select({
+        id: drops.id,
+        user_id: drops.user_id,
+        title: drops.title,
+        description: drops.description,
+        category: drops.category,
+        tech_stack: drops.tech_stack,
+        live_url: drops.live_url,
+        emoji: drops.emoji,
+        created_at: drops.created_at,
+        username: users.username,
+        display_name: users.display_name,
+        reputation_score: users.reputation_score,
+    })
+        .from(drops)
+        .leftJoin(users, eq(drops.user_id, users.id))
+        .where(and(...conditions))
+        .orderBy(desc(drops.created_at))
+        .limit(limit)
+        .offset(offset);
+    return c.json({ data: rows, page, limit });
 });
-// POST /drops
-dropsRoute.post("/", authMiddleware, apiRateLimit, zValidator("json", createDropSchema), async (c) => {
-    const payload = c.get("jwtPayload");
-    const { milestone: milestoneData, ...dropData } = c.req.valid("json");
+// POST /drops — auth required
+dropsRoute.post('/', authMiddleware, apiRateLimit, jsonSafeParse, zValidator('json', createDropSchema, (result, c) => {
+    if (!result.success) {
+        return c.json({ error: 'Validation failed', details: result.error.format() }, 400);
+    }
+}), async (c) => {
+    const { sub } = c.get('user');
+    const { milestone: msData, ...dropData } = c.req.valid('json');
+    const result = await db.transaction(async (tx) => {
+        const [drop] = await tx.insert(drops).values({
+            ...dropData,
+            user_id: sub,
+            live_url: dropData.live_url || null,
+            emoji: dropData.emoji ?? '🚀',
+        }).returning();
+        const [ms] = await tx.insert(milestones).values({
+            drop_id: drop.id,
+            user_id: sub,
+            goal: msData.goal,
+            deadline: msData.deadline,
+            proof_type: msData.proof_type,
+            status: 'active',
+            order: 1,
+        }).returning();
+        return { drop, milestone: ms };
+    });
+    reputationQueue.push(() => updateReputationAndRank(sub));
+    return c.json(result, 201);
+});
+// GET /drops/:id — public
+dropsRoute.get('/:id', async (c) => {
+    const id = c.req.param('id');
+    const [drop] = await db.select().from(drops)
+        .where(and(eq(drops.id, id), isNull(drops.deleted_at)));
+    if (!drop)
+        return c.json({ error: 'Drop not found' }, 404);
+    const [owner] = await db.select({
+        username: users.username,
+        display_name: users.display_name,
+        bio: users.bio,
+        reputation_score: users.reputation_score,
+        open_to: users.open_to,
+        github_url: users.github_url,
+    }).from(users).where(eq(users.id, drop.user_id));
+    const ms = await db.select().from(milestones)
+        .where(eq(milestones.drop_id, id))
+        .orderBy(milestones.order);
+    const ps = ms.length > 0
+        ? await db.select().from(proofs)
+            .where(or(...ms.map(m => eq(proofs.milestone_id, m.id))))
+        : [];
+    const milestonesWithProofs = ms.map(m => ({
+        ...m,
+        proof: ps.find(p => p.milestone_id === m.id) ?? null
+    }));
+    const shipped = ms.filter(m => m.status === 'done').length;
+    const score = ms.length > 0 ? Math.round(shipped / ms.length * 100) : 0;
+    return c.json({ ...drop, owner, milestones: milestonesWithProofs, score });
+});
+// PATCH /drops/:id — owner only
+dropsRoute.patch('/:id', authMiddleware, apiRateLimit, jsonSafeParse, async (c) => {
+    const { sub } = c.get('user');
+    const id = c.req.param('id');
+    let body;
     try {
-        const result = await db.transaction(async (tx) => {
-            const [newDrop] = await tx.insert(drops).values({
-                ...dropData,
-                userId: payload.sub,
-            }).returning();
-            const [newMilestone] = await tx.insert(milestones).values({
-                ...milestoneData,
-                dropId: newDrop.id,
-                userId: payload.sub,
-                order: 1,
-            }).returning();
-            return { drop: newDrop, milestone: newMilestone };
-        });
-        reputationQueue.add(() => updateReputationAndRank(payload.sub));
-        return c.json(result);
+        body = await c.req.json();
     }
     catch (err) {
-        return c.json({ error: "Failed to create drop" }, 500);
+        // This should normally be caught by jsonSafeParse, but as a double safety:
+        return c.json({ error: 'Invalid JSON body' }, 400);
     }
-});
-// GET /drops/:id
-dropsRoute.get("/:id", async (c) => {
-    const id = c.req.param("id");
-    const drop = await db.query.drops.findFirst({
-        where: and(eq(drops.id, id), isNull(drops.deletedAt)),
-        with: {
-            user: {
-                columns: {
-                    id: true,
-                    username: true,
-                    displayName: true,
-                    reputationScore: true,
-                }
-            },
-            milestones: {
-                orderBy: [sql `"order" ASC`],
-            }
-        }
-    });
+    const [drop] = await db.select({ user_id: drops.user_id }).from(drops)
+        .where(and(eq(drops.id, id), isNull(drops.deleted_at)));
     if (!drop)
-        return c.json({ error: "Drop not found" }, 404);
-    const dropProofs = await db.query.proofs.findMany({
-        where: eq(proofs.userId, drop.userId),
-    });
-    const shippedCount = drop.milestones.filter(m => m.status === 'done').length;
-    const totalCount = drop.milestones.length;
-    const score = totalCount > 0 ? (shippedCount / totalCount) * 100 : 0;
-    return c.json({
-        ...drop,
-        proofs: dropProofs,
-        score: parseFloat(score.toFixed(1))
-    });
+        return c.json({ error: 'Drop not found' }, 404);
+    if (drop.user_id !== sub)
+        return c.json({ error: 'Forbidden' }, 403);
+    const allowed = ['title', 'description', 'category', 'tech_stack', 'live_url', 'emoji'];
+    const patch = Object.fromEntries(Object.entries(body).filter(([k]) => allowed.includes(k)));
+    const [updated] = await db.update(drops).set(patch).where(eq(drops.id, id)).returning();
+    return c.json(updated);
 });
-// PATCH /drops/:id
-dropsRoute.patch("/:id", authMiddleware, apiRateLimit, zValidator("json", updateDropSchema), async (c) => {
-    const payload = c.get("jwtPayload");
-    const id = c.req.param("id");
-    const body = c.req.valid("json");
-    const drop = await db.query.drops.findFirst({
-        where: eq(drops.id, id),
-    });
-    if (!drop || drop.deletedAt)
-        return c.json({ error: "Drop not found" }, 404);
-    if (drop.userId !== payload.sub)
-        return c.json({ error: "Forbidden" }, 403);
-    const [updatedDrop] = await db.update(drops)
-        .set(body)
-        .where(eq(drops.id, id))
-        .returning();
-    return c.json(updatedDrop);
-});
-// DELETE /drops/:id
-dropsRoute.delete("/:id", authMiddleware, apiRateLimit, async (c) => {
-    const payload = c.get("jwtPayload");
-    const id = c.req.param("id");
-    const drop = await db.query.drops.findFirst({
-        where: eq(drops.id, id),
-    });
-    if (!drop || drop.deletedAt)
-        return c.json({ error: "Drop not found" }, 404);
-    if (drop.userId !== payload.sub)
-        return c.json({ error: "Forbidden" }, 403);
-    await db.update(drops)
-        .set({ deletedAt: new Date() })
-        .where(eq(drops.id, id));
+// DELETE /drops/:id — soft delete, owner only
+dropsRoute.delete('/:id', authMiddleware, async (c) => {
+    const user = c.get('user');
+    if (!user)
+        return c.json({ error: 'Unauthorized' }, 401);
+    const { sub } = user;
+    const id = c.req.param('id');
+    const [drop] = await db.select({ user_id: drops.user_id }).from(drops)
+        .where(and(eq(drops.id, id), isNull(drops.deleted_at)));
+    if (!drop)
+        return c.json({ error: 'Drop not found' }, 404);
+    if (drop.user_id !== sub)
+        return c.json({ error: 'Forbidden' }, 403);
+    await db.update(drops).set({ deleted_at: new Date() }).where(eq(drops.id, id));
     return c.json({ ok: true });
 });
 export default dropsRoute;

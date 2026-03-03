@@ -5,51 +5,45 @@ export const calcReputation = async (userId) => {
     const user = await db.query.users.findFirst({
         where: eq(users.id, userId),
     });
-    if (!user) {
+    if (!user)
         throw new Error("User not found");
-    }
-    // 1. Completion Rate
-    const allMilestones = await db.query.milestones.findMany({
-        where: eq(milestones.userId, userId),
-    });
+    const allMilestones = await db.select().from(milestones)
+        .where(eq(milestones.user_id, userId));
     let completionRate = 0;
     if (allMilestones.length > 0) {
         const weights = {
-            done: 100,
-            active: 20,
-            pending: 10,
-            missed: 0,
+            done: 100, active: 20, pending: 10, missed: 0,
         };
-        const totalWeight = allMilestones.reduce((acc, m) => acc + (weights[m.status] || 0), 0);
+        const totalWeight = allMilestones.reduce((acc, m) => acc + (weights[m.status] ?? 0), 0);
         completionRate = totalWeight / allMilestones.length;
     }
-    // 2. Velocity
     const ninetyDaysAgo = new Date();
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
-    const recentlyDone = await db.query.milestones.findMany({
-        where: and(eq(milestones.userId, userId), eq(milestones.status, "done"), gt(milestones.completedAt, ninetyDaysAgo)),
-    });
+    const recentlyDone = await db.select().from(milestones)
+        .where(and(eq(milestones.user_id, userId), eq(milestones.status, "done"), gt(milestones.completed_at, ninetyDaysAgo)));
     const velocity = Math.min(recentlyDone.length * 20, 100);
-    // 3. Streak Score
-    const streakScore = Math.min(user.streak * 14, 100);
-    // 4. Proof Quality
-    const userProofs = await db.query.proofs.findMany({
-        where: eq(proofs.userId, userId),
-    });
+    const streakScore = Math.min((user.streak ?? 0) * 14, 100);
+    const userProofs = await db.select().from(proofs)
+        .where(eq(proofs.user_id, userId));
     let pts = Math.min(userProofs.length * 15, 50);
     for (const p of userProofs) {
-        if (isValidUrl(p.url))
+        if (p.url && isValidUrl(p.url))
             pts += 10;
         if (p.note && p.note.length > 20)
             pts += 5;
     }
     const proofQuality = Math.min(pts, 100);
-    // Final Total
     const total = parseFloat((completionRate * 0.45 +
         velocity * 0.25 +
         streakScore * 0.15 +
         proofQuality * 0.15).toFixed(1));
-    return { completionRate, velocity, streakScore, proofQuality, total: Math.min(Math.max(total, 0), 100) };
+    return {
+        completionRate: Math.round(completionRate),
+        velocity,
+        streakScore,
+        proofQuality,
+        total: Math.min(Math.max(total, 0), 100),
+    };
 };
 const isValidUrl = (url) => {
     try {
@@ -63,21 +57,25 @@ const isValidUrl = (url) => {
 export const updateReputationAndRank = async (userId) => {
     const breakdown = await calcReputation(userId);
     await db.update(users)
-        .set({ reputationScore: breakdown.total.toString() })
+        .set({ reputation_score: breakdown.total.toString() })
         .where(eq(users.id, userId));
     await recalcAllRanks();
 };
 export const recalcAllRanks = async () => {
-    // Use raw SQL for ROW_NUMBER() as requested
     await db.execute(sql `
-    WITH RankedUsers AS (
-      SELECT id, ROW_NUMBER() OVER (ORDER BY reputation_score DESC, streak DESC, username ASC) as new_rank
+    WITH ranked AS (
+      SELECT id,
+        ROW_NUMBER() OVER (
+          ORDER BY reputation_score::numeric DESC,
+          streak DESC,
+          username ASC
+        ) AS new_rank
       FROM users
     )
     UPDATE users
-    SET rank = RankedUsers.new_rank
-    FROM RankedUsers
-    WHERE users.id = RankedUsers.id;
+    SET rank = ranked.new_rank
+    FROM ranked
+    WHERE users.id = ranked.id
   `);
 };
 //# sourceMappingURL=reputation.js.map

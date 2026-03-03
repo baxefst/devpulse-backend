@@ -21,7 +21,7 @@ export const verifyAccessToken = async (token) => {
         const { payload } = await jwtVerify(token, ACCESS_SECRET);
         return payload;
     }
-    catch (err) {
+    catch {
         return null;
     }
 };
@@ -30,7 +30,7 @@ export const verifyRefreshToken = async (token) => {
         const { payload } = await jwtVerify(token, REFRESH_SECRET);
         return payload;
     }
-    catch (err) {
+    catch {
         return null;
     }
 };
