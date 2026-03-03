@@ -8,7 +8,7 @@ RUN npm install
 
 COPY . .
 
-RUN ./node_modules/.bin/tsc
+RUN npx tsc
 
 EXPOSE 3000
 
