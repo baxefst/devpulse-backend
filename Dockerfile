@@ -6,11 +6,9 @@ COPY package*.json ./
 
 RUN npm install
 
-RUN chmod +x node_modules/.bin/tsc
-
 COPY . .
 
-RUN node_modules/.bin/tsc
+RUN chmod +x node_modules/.bin/tsc && node_modules/.bin/tsc
 
 EXPOSE 3000
 
